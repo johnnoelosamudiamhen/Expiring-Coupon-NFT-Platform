@@ -10,8 +10,13 @@
 (define-constant err-coupon-not-found (err u106))
 (define-constant err-unauthorized-merchant (err u107))
 (define-constant err-merchant-not-found (err u108))
+(define-constant err-listing-not-found (err u109))
+(define-constant err-insufficient-payment (err u110))
+(define-constant err-cannot-buy-own-listing (err u111))
+(define-constant err-listing-expired (err u112))
 
 (define-data-var last-token-id uint u0)
+(define-data-var last-listing-id uint u0)
 
 (define-map merchants principal bool)
 
@@ -47,6 +52,27 @@
   {
     total-redeemed: uint,
     total-savings: uint
+  }
+)
+
+(define-map marketplace-listings 
+  uint 
+  {
+    token-id: uint,
+    seller: principal,
+    price: uint,
+    listing-expiry: uint,
+    is-active: bool
+  }
+)
+
+(define-map listing-history 
+  uint 
+  {
+    seller: principal,
+    buyer: principal,
+    price: uint,
+    sold-block: uint
   }
 )
 
@@ -108,6 +134,37 @@
 
 (define-read-only (calculate-discount (amount uint) (discount-percentage uint))
   (/ (* amount discount-percentage) u100)
+)
+
+(define-read-only (get-marketplace-listing (listing-id uint))
+  (map-get? marketplace-listings listing-id)
+)
+
+(define-read-only (get-listing-history (listing-id uint))
+  (map-get? listing-history listing-id)
+)
+
+(define-read-only (is-listing-valid (listing-id uint))
+  (match (map-get? marketplace-listings listing-id)
+    listing-info
+    (let 
+      (
+        (current-block stacks-block-height)
+        (coupon-validity (is-coupon-valid (get token-id listing-info)))
+      )
+      {
+        valid: (and 
+          (get is-active listing-info)
+          (< current-block (get listing-expiry listing-info))
+          (get valid coupon-validity)
+        ),
+        active: (get is-active listing-info),
+        expired: (>= current-block (get listing-expiry listing-info)),
+        coupon-valid: (get valid coupon-validity)
+      }
+    )
+    {valid: false, active: false, expired: true, coupon-valid: false}
+  )
 )
 
 (define-public (add-merchant (merchant-address principal))
@@ -276,6 +333,80 @@
     )
     (asserts! (is-eq tx-sender coupon-owner) err-not-token-owner)
     (nft-burn? coupon-nft token-id coupon-owner)
+  )
+)
+
+(define-public (create-listing (token-id uint) (price uint) (listing-duration uint))
+  (let 
+    (
+      (coupon-owner (unwrap! (nft-get-owner? coupon-nft token-id) err-coupon-not-found))
+      (coupon-validity (is-coupon-valid token-id))
+      (listing-id (+ (var-get last-listing-id) u1))
+      (listing-expiry (+ stacks-block-height listing-duration))
+    )
+    (asserts! (is-eq tx-sender coupon-owner) err-not-token-owner)
+    (asserts! (get valid coupon-validity) err-coupon-expired)
+    (asserts! (> price u0) err-invalid-discount)
+    (asserts! (> listing-duration u0) err-invalid-expiry)
+    
+    (map-set marketplace-listings listing-id {
+      token-id: token-id,
+      seller: tx-sender,
+      price: price,
+      listing-expiry: listing-expiry,
+      is-active: true
+    })
+    
+    (var-set last-listing-id listing-id)
+    (ok listing-id)
+  )
+)
+
+(define-public (cancel-listing (listing-id uint))
+  (let 
+    (
+      (listing-info (unwrap! (map-get? marketplace-listings listing-id) err-listing-not-found))
+      (seller (get seller listing-info))
+    )
+    (asserts! (is-eq tx-sender seller) err-not-token-owner)
+    (asserts! (get is-active listing-info) err-listing-expired)
+    
+    (map-set marketplace-listings listing-id (merge listing-info {is-active: false}))
+    (ok true)
+  )
+)
+
+(define-public (buy-coupon (listing-id uint))
+  (let 
+    (
+      (listing-info (unwrap! (map-get? marketplace-listings listing-id) err-listing-not-found))
+      (listing-validity (is-listing-valid listing-id))
+      (token-id (get token-id listing-info))
+      (seller (get seller listing-info))
+      (price (get price listing-info))
+      (buyer tx-sender)
+    )
+    (asserts! (get valid listing-validity) err-listing-expired)
+    (asserts! (not (is-eq buyer seller)) err-cannot-buy-own-listing)
+    
+    (try! (stx-transfer? price buyer seller))
+    (try! (nft-transfer? coupon-nft token-id seller buyer))
+    
+    (map-set marketplace-listings listing-id (merge listing-info {is-active: false}))
+    
+    (map-set listing-history listing-id {
+      seller: seller,
+      buyer: buyer,
+      price: price,
+      sold-block: stacks-block-height
+    })
+    
+    (ok {
+      token-id: token-id,
+      seller: seller,
+      buyer: buyer,
+      price: price
+    })
   )
 )
 

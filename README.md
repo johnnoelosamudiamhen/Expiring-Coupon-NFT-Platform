@@ -19,6 +19,7 @@ The Expiring Coupon NFT Platform transforms traditional coupon systems by levera
 - **Transparent Expiry**: Clear visibility of coupon validity and expiration
 - **Transferable**: Send coupons to other users (if desired)
 - **Savings Tracking**: Monitor total redemptions and savings achieved
+- **Marketplace Trading**: Buy and sell unused coupons in a decentralized marketplace
 
 ### 🔧 Technical Features
 - **Time-Based Validation**: Automatic expiry checking using block height
@@ -107,6 +108,25 @@ npm test
 (contract-call? .expiring-coupon-nft-platform burn-coupon u1)
 ```
 
+#### Create Marketplace Listing
+```clarity
+(contract-call? .expiring-coupon-nft-platform create-listing 
+  u1          ;; token-id
+  u50         ;; price in STX
+  u144        ;; listing expires in 144 blocks (~24 hours)
+)
+```
+
+#### Buy Coupon from Marketplace
+```clarity
+(contract-call? .expiring-coupon-nft-platform buy-coupon u1)  ;; listing-id
+```
+
+#### Cancel Listing
+```clarity
+(contract-call? .expiring-coupon-nft-platform cancel-listing u1)  ;; listing-id
+```
+
 ## 📊 Read-Only Functions
 
 ### Check Coupon Validity
@@ -130,6 +150,21 @@ npm test
 ;; Returns u20 (20% of 100)
 ```
 
+### Get Marketplace Listing
+```clarity
+(contract-call? .expiring-coupon-nft-platform get-marketplace-listing u1)
+```
+
+### Check Listing Validity
+```clarity
+(contract-call? .expiring-coupon-nft-platform is-listing-valid u1)
+```
+
+### Get Listing History
+```clarity
+(contract-call? .expiring-coupon-nft-platform get-listing-history u1)
+```
+
 ## 🏗️ Contract Architecture
 
 ### Data Structures
@@ -139,6 +174,8 @@ npm test
 - **Usage Tracking**: Per-user redemption history
 - **Merchant Registry**: Authorized coupon issuers
 - **Analytics**: Comprehensive statistics for all participants
+- **Marketplace Listings**: Secondary market for coupon trading
+- **Listing History**: Complete transaction records for marketplace sales
 
 ### Security Features
 
@@ -173,6 +210,10 @@ clarinet deploy --testnet
 | u106 | err-coupon-not-found | Specified coupon doesn't exist |
 | u107 | err-unauthorized-merchant | Caller is not a registered merchant |
 | u108 | err-merchant-not-found | Merchant not found in registry |
+| u109 | err-listing-not-found | Marketplace listing doesn't exist |
+| u110 | err-insufficient-payment | Not enough STX provided for purchase |
+| u111 | err-cannot-buy-own-listing | Users cannot buy their own listings |
+| u112 | err-listing-expired | Marketplace listing has expired |
 
 ## 🤝 Contributing
 
