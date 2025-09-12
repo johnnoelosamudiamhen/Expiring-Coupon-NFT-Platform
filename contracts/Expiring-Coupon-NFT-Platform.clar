@@ -14,9 +14,12 @@
 (define-constant err-insufficient-payment (err u110))
 (define-constant err-cannot-buy-own-listing (err u111))
 (define-constant err-listing-expired (err u112))
+(define-constant err-batch-limit-exceeded (err u113))
+(define-constant err-batch-empty (err u114))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-listing-id uint u0)
+(define-data-var max-batch-size uint u10)
 
 (define-map merchants principal bool)
 
@@ -439,5 +442,148 @@
       })
     )
     err-coupon-not-found
+  )
+)
+
+(define-read-only (get-max-batch-size)
+  (var-get max-batch-size)
+)
+
+(define-private (mint-single-coupon 
+  (recipient principal) 
+  (discount-percentage uint) 
+  (expiry-blocks uint) 
+  (max-uses uint)
+  (coupon-type (string-ascii 20))
+)
+  (let 
+    (
+      (token-id (+ (var-get last-token-id) u1))
+      (expiry-block (+ stacks-block-height expiry-blocks))
+      (merchant tx-sender)
+    )
+    (try! (nft-mint? coupon-nft token-id recipient))
+    
+    (map-set coupon-data token-id {
+      merchant: merchant,
+      discount-percentage: discount-percentage,
+      expiry-block: expiry-block,
+      max-uses: max-uses,
+      current-uses: u0,
+      is-active: true,
+      coupon-type: coupon-type
+    })
+    
+    (var-set last-token-id token-id)
+    (ok token-id)
+  )
+)
+
+(define-private (process-batch-redemption 
+  (token-id uint) 
+  (acc-result {total-discount: uint, successful-redemptions: uint, failed-redemptions: uint, purchase-amount: uint})
+)
+  (match (redeem-coupon token-id (get purchase-amount acc-result))
+    redemption-result
+    {
+      total-discount: (+ (get total-discount acc-result) (get discount-applied redemption-result)),
+      successful-redemptions: (+ (get successful-redemptions acc-result) u1),
+      failed-redemptions: (get failed-redemptions acc-result),
+      purchase-amount: (get purchase-amount acc-result)
+    }
+    error-code
+    {
+      total-discount: (get total-discount acc-result),
+      successful-redemptions: (get successful-redemptions acc-result),
+      failed-redemptions: (+ (get failed-redemptions acc-result) u1),
+      purchase-amount: (get purchase-amount acc-result)
+    }
+  )
+)
+
+(define-public (set-max-batch-size (new-size uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (> new-size u0) (<= new-size u50)) err-invalid-discount)
+    (var-set max-batch-size new-size)
+    (ok true)
+  )
+)
+
+(define-public (batch-mint-coupons 
+  (recipients (list 10 principal))
+  (discount-percentage uint)
+  (expiry-blocks uint)
+  (max-uses uint)
+  (coupon-type (string-ascii 20))
+)
+  (let 
+    (
+      (batch-size (len recipients))
+      (merchant tx-sender)
+    )
+    (asserts! (is-merchant merchant) err-unauthorized-merchant)
+    (asserts! (and (> discount-percentage u0) (<= discount-percentage u100)) err-invalid-discount)
+    (asserts! (> expiry-blocks u0) err-invalid-expiry)
+    (asserts! (> max-uses u0) err-invalid-discount)
+    (asserts! (> batch-size u0) err-batch-empty)
+    (asserts! (<= batch-size (var-get max-batch-size)) err-batch-limit-exceeded)
+    
+    (let 
+      (
+        (minted-tokens (map mint-single-coupon 
+          recipients 
+          (list discount-percentage discount-percentage discount-percentage discount-percentage discount-percentage discount-percentage discount-percentage discount-percentage discount-percentage discount-percentage)
+          (list expiry-blocks expiry-blocks expiry-blocks expiry-blocks expiry-blocks expiry-blocks expiry-blocks expiry-blocks expiry-blocks expiry-blocks)
+          (list max-uses max-uses max-uses max-uses max-uses max-uses max-uses max-uses max-uses max-uses)
+          (list coupon-type coupon-type coupon-type coupon-type coupon-type coupon-type coupon-type coupon-type coupon-type coupon-type)
+        ))
+      )
+      (match (map-get? merchant-stats merchant)
+        existing-stats
+        (map-set merchant-stats merchant {
+          total-coupons-issued: (+ (get total-coupons-issued existing-stats) batch-size),
+          total-coupons-redeemed: (get total-coupons-redeemed existing-stats),
+          total-discount-given: (get total-discount-given existing-stats)
+        })
+        (map-set merchant-stats merchant {
+          total-coupons-issued: batch-size,
+          total-coupons-redeemed: u0,
+          total-discount-given: u0
+        })
+      )
+      
+      (ok {
+        minted-count: batch-size,
+        token-ids: minted-tokens
+      })
+    )
+  )
+)
+
+(define-public (batch-redeem-coupons 
+  (token-ids (list 10 uint))
+  (purchase-amount uint)
+)
+  (let 
+    (
+      (batch-size (len token-ids))
+      (initial-result {total-discount: u0, successful-redemptions: u0, failed-redemptions: u0, purchase-amount: purchase-amount})
+    )
+    (asserts! (> batch-size u0) err-batch-empty)
+    (asserts! (<= batch-size (var-get max-batch-size)) err-batch-limit-exceeded)
+    (asserts! (> purchase-amount u0) err-invalid-discount)
+    
+    (let 
+      (
+        (final-result (fold process-batch-redemption token-ids initial-result))
+      )
+      (ok {
+        total-discount: (get total-discount final-result),
+        successful-redemptions: (get successful-redemptions final-result),
+        failed-redemptions: (get failed-redemptions final-result),
+        final-amount: (- (* purchase-amount (get successful-redemptions final-result)) (get total-discount final-result))
+      })
+    )
   )
 )
