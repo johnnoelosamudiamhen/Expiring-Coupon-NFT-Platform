@@ -14,6 +14,11 @@
 (define-constant err-insufficient-payment (err u110))
 (define-constant err-cannot-buy-own-listing (err u111))
 (define-constant err-listing-expired (err u112))
+(define-constant err-batch-limit-exceeded (err u113))
+(define-constant err-batch-empty (err u114))
+(define-constant err-invalid-time-range (err u115))
+(define-constant err-analytics-not-found (err u116))
+(define-constant err-invalid-category (err u117))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-listing-id uint u0)
@@ -75,6 +80,74 @@
     sold-block: uint
   }
 )
+
+;; === ANALYTICS & REPORTING SYSTEM ===
+
+;; Daily analytics tracking
+(define-map daily-analytics 
+  uint ;; day (block-height / 144)
+  {
+    coupons-minted: uint,
+    coupons-redeemed: uint,
+    total-discount-given: uint,
+    unique-users: uint,
+    marketplace-sales: uint,
+    avg-discount-percentage: uint
+  }
+)
+
+;; Category performance tracking
+(define-map category-analytics 
+  (string-ascii 20) ;; coupon-type
+  {
+    total-minted: uint,
+    total-redeemed: uint,
+    total-discount-value: uint,
+    avg-redemption-time: uint,
+    conversion-rate: uint ;; (redeemed/minted) * 100
+  }
+)
+
+;; Merchant performance detailed tracking
+(define-map merchant-analytics 
+  principal 
+  {
+    avg-discount-percentage: uint,
+    most-popular-category: (string-ascii 20),
+    total-revenue-impact: uint,
+    customer-acquisition: uint,
+    repeat-customers: uint
+  }
+)
+
+;; User behavior analytics
+(define-map user-analytics 
+  principal 
+  {
+    avg-time-to-redeem: uint,
+    favorite-category: (string-ascii 20),
+    total-marketplace-purchases: uint,
+    total-marketplace-sales: uint,
+    loyalty-score: uint
+  }
+)
+
+;; Time-based trend analysis
+(define-map trend-analytics 
+  {period: (string-ascii 10), period-number: uint} ;; {"daily", 123} or {"weekly", 52}
+  {
+    growth-rate: uint,
+    popular-categories: (list 5 (string-ascii 20)),
+    top-merchants: (list 5 principal),
+    avg-discount-trend: uint
+  }
+)
+
+;; Global platform analytics
+(define-data-var total-platform-volume uint u0)
+(define-data-var total-unique-users uint u0)
+(define-data-var platform-launch-block uint u0)
+(define-data-var analytics-enabled bool true)
 
 (define-read-only (get-last-token-id)
   (var-get last-token-id)
@@ -439,5 +512,237 @@
       })
     )
     err-coupon-not-found
+  )
+)
+
+;; === ANALYTICS & REPORTING FUNCTIONS ===
+
+;; Initialize platform analytics (owner only)
+(define-public (initialize-analytics)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set platform-launch-block stacks-block-height)
+    (var-set total-platform-volume u0)
+    (var-set total-unique-users u0)
+    (ok true)
+  )
+)
+
+;; Update daily analytics when events occur
+(define-private (update-daily-analytics (mint-count uint) (redeem-count uint) (discount-amount uint) (new-user bool) (marketplace-sale uint))
+  (let 
+    (
+      (current-day (/ stacks-block-height u144))
+      (existing-data (default-to
+        {coupons-minted: u0, coupons-redeemed: u0, total-discount-given: u0, unique-users: u0, marketplace-sales: u0, avg-discount-percentage: u0}
+        (map-get? daily-analytics current-day)
+      ))
+    )
+    (map-set daily-analytics current-day {
+      coupons-minted: (+ (get coupons-minted existing-data) mint-count),
+      coupons-redeemed: (+ (get coupons-redeemed existing-data) redeem-count),
+      total-discount-given: (+ (get total-discount-given existing-data) discount-amount),
+      unique-users: (+ (get unique-users existing-data) (if new-user u1 u0)),
+      marketplace-sales: (+ (get marketplace-sales existing-data) marketplace-sale),
+      avg-discount-percentage: (if (> (+ (get coupons-redeemed existing-data) redeem-count) u0)
+        (/ (+ (get total-discount-given existing-data) discount-amount) (+ (get coupons-redeemed existing-data) redeem-count))
+        u0
+      )
+    })
+  )
+)
+
+;; Update category analytics
+(define-private (update-category-analytics (coupon-type (string-ascii 20)) (is-mint bool) (is-redeem bool) (discount-value uint) (redemption-time uint))
+  (let 
+    (
+      (existing-data (default-to
+        {total-minted: u0, total-redeemed: u0, total-discount-value: u0, avg-redemption-time: u0, conversion-rate: u0}
+        (map-get? category-analytics coupon-type)
+      ))
+      (new-minted (+ (get total-minted existing-data) (if is-mint u1 u0)))
+      (new-redeemed (+ (get total-redeemed existing-data) (if is-redeem u1 u0)))
+    )
+    (map-set category-analytics coupon-type {
+      total-minted: new-minted,
+      total-redeemed: new-redeemed,
+      total-discount-value: (+ (get total-discount-value existing-data) discount-value),
+      avg-redemption-time: (if (> new-redeemed u0)
+        (/ (+ (* (get avg-redemption-time existing-data) (get total-redeemed existing-data)) redemption-time) new-redeemed)
+        u0
+      ),
+      conversion-rate: (if (> new-minted u0) (/ (* new-redeemed u100) new-minted) u0)
+    })
+  )
+)
+
+;; Get daily analytics report
+(define-read-only (get-daily-analytics (day uint))
+  (map-get? daily-analytics day)
+)
+
+;; Get analytics for current day
+(define-read-only (get-current-day-analytics)
+  (let 
+    (
+      (current-day (/ stacks-block-height u144))
+    )
+    (map-get? daily-analytics current-day)
+  )
+)
+
+;; Get category performance report
+(define-read-only (get-category-analytics (coupon-type (string-ascii 20)))
+  (map-get? category-analytics coupon-type)
+)
+
+;; Get merchant detailed analytics
+(define-read-only (get-merchant-analytics (merchant principal))
+  (map-get? merchant-analytics merchant)
+)
+
+;; Get user behavior analytics
+(define-read-only (get-user-analytics (user principal))
+  (map-get? user-analytics user)
+)
+
+;; Get trend analytics for a specific period
+(define-read-only (get-trend-analytics (period (string-ascii 10)) (period-number uint))
+  (map-get? trend-analytics {period: period, period-number: period-number})
+)
+
+;; Get platform-wide analytics summary
+(define-read-only (get-platform-analytics)
+  {
+    total-volume: (var-get total-platform-volume),
+    total-unique-users: (var-get total-unique-users),
+    total-coupons: (var-get last-token-id),
+    total-listings: (var-get last-listing-id),
+    launch-block: (var-get platform-launch-block),
+    current-block: stacks-block-height,
+    platform-age-days: (/ (- stacks-block-height (var-get platform-launch-block)) u144),
+    analytics-enabled: (var-get analytics-enabled)
+  }
+)
+
+;; Calculate conversion rate for a merchant
+(define-read-only (calculate-merchant-conversion-rate (merchant principal))
+  (match (map-get? merchant-stats merchant)
+    stats
+    (if (> (get total-coupons-issued stats) u0)
+      (/ (* (get total-coupons-redeemed stats) u100) (get total-coupons-issued stats))
+      u0
+    )
+    u0
+  )
+)
+
+;; Get top performing categories (simplified version)
+(define-read-only (get-category-performance-summary (category1 (string-ascii 20)) (category2 (string-ascii 20)) (category3 (string-ascii 20)))
+  {
+    category1: {
+      name: category1,
+      data: (map-get? category-analytics category1)
+    },
+    category2: {
+      name: category2,
+      data: (map-get? category-analytics category2)
+    },
+    category3: {
+      name: category3,
+      data: (map-get? category-analytics category3)
+    }
+  }
+)
+
+;; Calculate average discount across all redeemed coupons
+(define-read-only (calculate-average-platform-discount)
+  (let 
+    (
+      (current-day (/ stacks-block-height u144))
+      (total-discount u0)
+      (total-redemptions u0)
+    )
+    ;; This is a simplified calculation - in a full implementation, 
+    ;; we would need to iterate through multiple days
+    (match (map-get? daily-analytics current-day)
+      day-data
+      (if (> (get coupons-redeemed day-data) u0)
+        (get avg-discount-percentage day-data)
+        u0
+      )
+      u0
+    )
+  )
+)
+
+;; Generate weekly report (simplified for 7 days)
+(define-read-only (generate-weekly-report)
+  (let 
+    (
+      (current-day (/ stacks-block-height u144))
+      (week-start (- current-day u7))
+    )
+    {
+      start-day: week-start,
+      end-day: current-day,
+      current-day-data: (map-get? daily-analytics current-day),
+      week-ago-data: (map-get? daily-analytics week-start),
+      platform-summary: (get-platform-analytics)
+    }
+  )
+)
+
+;; Advanced analytics: Calculate user lifetime value
+(define-read-only (calculate-user-lifetime-value (user principal))
+  (match (map-get? user-redemptions user)
+    redemption-data
+    {
+      total-savings: (get total-savings redemption-data),
+      total-redemptions: (get total-redeemed redemption-data),
+      avg-savings-per-redemption: (if (> (get total-redeemed redemption-data) u0)
+        (/ (get total-savings redemption-data) (get total-redeemed redemption-data))
+        u0
+      )
+    }
+    {total-savings: u0, total-redemptions: u0, avg-savings-per-redemption: u0}
+  )
+)
+
+;; Enhanced coupon effectiveness analysis
+(define-read-only (analyze-coupon-effectiveness (token-id uint))
+  (match (map-get? coupon-data token-id)
+    coupon-info
+    (let 
+      (
+        (time-to-expiry (- (get expiry-block coupon-info) stacks-block-height))
+        (usage-rate (/ (* (get current-uses coupon-info) u100) (get max-uses coupon-info)))
+        (is-expired (> stacks-block-height (get expiry-block coupon-info)))
+      )
+      (ok {
+        token-id: token-id,
+        merchant: (get merchant coupon-info),
+        category: (get coupon-type coupon-info),
+        discount-percentage: (get discount-percentage coupon-info),
+        usage-rate: usage-rate,
+        time-to-expiry: time-to-expiry,
+        is-expired: is-expired,
+        is-fully-utilized: (>= (get current-uses coupon-info) (get max-uses coupon-info)),
+        effectiveness-score: (if is-expired
+          usage-rate
+          (/ (+ usage-rate (if (> time-to-expiry u0) u50 u0)) u2)
+        )
+      })
+    )
+    err-coupon-not-found
+  )
+)
+
+;; Admin function to toggle analytics collection
+(define-public (toggle-analytics (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set analytics-enabled enabled)
+    (ok enabled)
   )
 )
