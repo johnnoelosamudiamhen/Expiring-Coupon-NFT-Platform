@@ -19,11 +19,44 @@
 (define-constant err-invalid-time-range (err u115))
 (define-constant err-analytics-not-found (err u116))
 (define-constant err-invalid-category (err u117))
+(define-constant err-bundle-not-found (err u118))
+(define-constant err-bundle-inactive (err u119))
+(define-constant err-invalid-quantity (err u120))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-listing-id uint u0)
+(define-data-var last-bundle-id uint u0)
 
 (define-map merchants principal bool)
+
+(define-map coupon-bundles
+  uint
+  {
+    bundle-name: (string-ascii 50),
+    merchant: principal,
+    discount-percentage: uint,
+    expiry-blocks: uint,
+    max-uses: uint,
+    coupon-type: (string-ascii 20),
+    quantity: uint,
+    created-block: uint,
+    is-active: bool
+  }
+)
+
+(define-map bundle-coupons
+  {bundle-id: uint, index: uint}
+  uint
+)
+
+(define-map bundle-stats
+  uint
+  {
+    total-minted: uint,
+    total-redeemed: uint,
+    total-transferred: uint
+  }
+)
 
 (define-map coupon-data 
   uint 
@@ -173,6 +206,18 @@
   (map-get? merchant-stats merchant)
 )
 
+(define-read-only (get-bundle (bundle-id uint))
+  (map-get? coupon-bundles bundle-id)
+)
+
+(define-read-only (get-bundle-stats (bundle-id uint))
+  (map-get? bundle-stats bundle-id)
+)
+
+(define-read-only (get-bundle-coupon (bundle-id uint) (index uint))
+  (map-get? bundle-coupons {bundle-id: bundle-id, index: index})
+)
+
 (define-read-only (get-user-redemptions (user principal))
   (map-get? user-redemptions user)
 )
@@ -258,6 +303,156 @@
     (asserts! (is-eq tx-sender contract-owner) err-owner-only)
     (map-delete merchants merchant-address)
     (ok true)
+  )
+)
+
+(define-public (create-bundle
+  (bundle-name (string-ascii 50))
+  (discount-percentage uint)
+  (expiry-blocks uint)
+  (max-uses uint)
+  (coupon-type (string-ascii 20))
+  (quantity uint)
+)
+  (let
+    (
+      (bundle-id (+ (var-get last-bundle-id) u1))
+      (merchant tx-sender)
+    )
+    (asserts! (is-merchant merchant) err-unauthorized-merchant)
+    (asserts! (and (> discount-percentage u0) (<= discount-percentage u100)) err-invalid-discount)
+    (asserts! (> expiry-blocks u0) err-invalid-expiry)
+    (asserts! (> max-uses u0) err-invalid-discount)
+    (asserts! (and (> quantity u0) (<= quantity u50)) err-invalid-quantity)
+
+    (map-set coupon-bundles bundle-id {
+      bundle-name: bundle-name,
+      merchant: merchant,
+      discount-percentage: discount-percentage,
+      expiry-blocks: expiry-blocks,
+      max-uses: max-uses,
+      coupon-type: coupon-type,
+      quantity: quantity,
+      created-block: stacks-block-height,
+      is-active: true
+    })
+
+    (map-set bundle-stats bundle-id {
+      total-minted: u0,
+      total-redeemed: u0,
+      total-transferred: u0
+    })
+
+    (var-set last-bundle-id bundle-id)
+    (ok bundle-id)
+  )
+)
+
+(define-public (mint-from-bundle (bundle-id uint) (recipient principal))
+  (let
+    (
+      (bundle-info (unwrap! (map-get? coupon-bundles bundle-id) err-bundle-not-found))
+      (bundle-merchant (get merchant bundle-info))
+      (stats (default-to {total-minted: u0, total-redeemed: u0, total-transferred: u0} (map-get? bundle-stats bundle-id)))
+      (current-minted (get total-minted stats))
+    )
+    (asserts! (is-eq tx-sender bundle-merchant) err-unauthorized-merchant)
+    (asserts! (get is-active bundle-info) err-bundle-inactive)
+    (asserts! (< current-minted (get quantity bundle-info)) err-invalid-quantity)
+
+    (let
+      (
+        (token-id (+ (var-get last-token-id) u1))
+        (expiry-block (+ stacks-block-height (get expiry-blocks bundle-info)))
+      )
+      (try! (nft-mint? coupon-nft token-id recipient))
+
+      (map-set coupon-data token-id {
+        merchant: bundle-merchant,
+        discount-percentage: (get discount-percentage bundle-info),
+        expiry-block: expiry-block,
+        max-uses: (get max-uses bundle-info),
+        current-uses: u0,
+        is-active: true,
+        coupon-type: (get coupon-type bundle-info)
+      })
+
+      (map-set bundle-coupons {bundle-id: bundle-id, index: current-minted} token-id)
+
+      (map-set bundle-stats bundle-id {
+        total-minted: (+ current-minted u1),
+        total-redeemed: (get total-redeemed stats),
+        total-transferred: (get total-transferred stats)
+      })
+
+      (match (map-get? merchant-stats bundle-merchant)
+        existing-stats
+        (map-set merchant-stats bundle-merchant {
+          total-coupons-issued: (+ (get total-coupons-issued existing-stats) u1),
+          total-coupons-redeemed: (get total-coupons-redeemed existing-stats),
+          total-discount-given: (get total-discount-given existing-stats)
+        })
+        (map-set merchant-stats bundle-merchant {
+          total-coupons-issued: u1,
+          total-coupons-redeemed: u0,
+          total-discount-given: u0
+        })
+      )
+
+      (var-set last-token-id token-id)
+      (ok token-id)
+    )
+  )
+)
+
+(define-public (bulk-mint-from-bundle (bundle-id uint) (recipients (list 20 principal)))
+  (let
+    (
+      (bundle-info (unwrap! (map-get? coupon-bundles bundle-id) err-bundle-not-found))
+      (bundle-merchant (get merchant bundle-info))
+    )
+    (asserts! (is-eq tx-sender bundle-merchant) err-unauthorized-merchant)
+    (asserts! (get is-active bundle-info) err-bundle-inactive)
+
+    (ok (map mint-from-bundle-helper recipients))
+  )
+)
+
+(define-private (mint-from-bundle-helper (recipient principal))
+  recipient
+)
+
+(define-public (deactivate-bundle (bundle-id uint))
+  (let
+    (
+      (bundle-info (unwrap! (map-get? coupon-bundles bundle-id) err-bundle-not-found))
+      (merchant (get merchant bundle-info))
+    )
+    (asserts! (is-eq tx-sender merchant) err-unauthorized-merchant)
+
+    (map-set coupon-bundles bundle-id (merge bundle-info {is-active: false}))
+    (ok true)
+  )
+)
+
+(define-read-only (get-bundle-progress (bundle-id uint))
+  (match (map-get? coupon-bundles bundle-id)
+    bundle-info
+    (match (map-get? bundle-stats bundle-id)
+      stats
+      (ok {
+        bundle-id: bundle-id,
+        bundle-name: (get bundle-name bundle-info),
+        merchant: (get merchant bundle-info),
+        total-quantity: (get quantity bundle-info),
+        minted: (get total-minted stats),
+        remaining: (- (get quantity bundle-info) (get total-minted stats)),
+        is-active: (get is-active bundle-info),
+        created-block: (get created-block bundle-info)
+      })
+      err-bundle-not-found
+    )
+    err-bundle-not-found
   )
 )
 
